@@ -1,0 +1,61 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert_rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'external-api'
+    static_configs:
+      - targets: ['external-api:8088']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+    scrape_interval: 15s
+
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    scrape_interval: 15s
+
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+    scrape_interval: 15s
+
+  - job_name: 'clickhouse'
+    static_configs:
+      - targets: ['clickhouse-exporter:9116']
+    scrape_interval: 15s
+
+  - job_name: 'event-generator'
+    static_configs:
+      - targets: ['event-generator:9091']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  - job_name: 'redis-agg'
+    static_configs:
+      - targets: ['redis-agg:9092']
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+
+  - job_name: 'http-sink'
+    static_configs:
+      - targets: ['http-sink:9093']
+    metrics_path: '/metrics'
+    scrape_interval: 10s

@@ -1,0 +1,147 @@
+groups:
+  - name: thamanya_stack_alerts
+    rules:
+      # Service Availability Alerts
+      - alert: ServiceDown
+        expr: up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "{{ $labels.job }} service has been down for more than 30 seconds"
+
+      # Database Alerts
+      - alert: PostgreSQLHighConnections
+        expr: pg_stat_database_numbackends{datname="thm"} / pg_settings_max_connections * 100 > 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL connection usage is high"
+          description: "PostgreSQL connection usage is {{ $value }}% for database thm"
+
+      - alert: PostgreSQLLowCacheHitRate
+        expr: 100 * (pg_stat_database_blks_hit{datname="thm"} / (pg_stat_database_blks_hit{datname="thm"} + pg_stat_database_blks_read{datname="thm"})) < 95
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL cache hit rate is low"
+          description: "PostgreSQL cache hit rate is {{ $value }}% for database thm"
+
+      # Application Performance Alerts
+      - alert: EventGenerationStopped
+        expr: rate(events_generated_total[5m]) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Event generation has stopped"
+          description: "No events have been generated in the last 5 minutes"
+
+      - alert: HighDatabaseErrors
+        expr: rate(database_errors_total[5m]) > 0.1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High database error rate"
+          description: "Database error rate is {{ $value }} errors/sec"
+
+      - alert: MessageProcessingLag
+        expr: kafka_consumer_lag > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High Kafka consumer lag"
+          description: "Kafka consumer lag is {{ $value }} messages"
+
+      # Redis Alerts
+      - alert: RedisMemoryHigh
+        expr: redis_memory_used_bytes / redis_config_maxmemory * 100 > 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis memory usage is high"
+          description: "Redis memory usage is {{ $value }}%"
+
+      - alert: RedisConnectionDown
+        expr: redis_connection_active == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis connection is down"
+          description: "Redis connection has been down for more than 30 seconds"
+
+      # Kafka Alerts  
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_lag_sum > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: "Total Kafka consumer lag is {{ $value }} messages"
+
+      # API Performance Alerts
+      - alert: HighAPIResponseTime
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="external-api"}[5m])) > 1.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API response time is high"
+          description: "95th percentile API response time is {{ $value }} seconds"
+
+      - alert: HighAPIErrorRate
+        expr: rate(http_requests_total{job="external-api",status=~"5.."}[5m]) / rate(http_requests_total{job="external-api"}[5m]) > 0.05
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High API error rate"
+          description: "API error rate is {{ $value | humanizePercentage }}"
+
+      # ClickHouse Alerts
+      - alert: ClickHouseQueryPerformance
+        expr: histogram_quantile(0.95, rate(clickhouse_query_duration_seconds_bucket[5m])) > 5.0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ClickHouse query performance degraded"
+          description: "95th percentile query time is {{ $value }} seconds"
+
+  - name: infrastructure_alerts
+    rules:
+      # System Resource Alerts
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value }}%"
+
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU usage is {{ $value }}%"
+
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) * 100 < 15
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk space is low"
+          description: "Disk space on {{ $labels.mountpoint }} is {{ $value }}% available"

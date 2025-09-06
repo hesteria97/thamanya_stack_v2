@@ -1,0 +1,444 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    hostname: postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports: ["5432:5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    command: ["postgres","-c","wal_level=logical","-c","max_wal_senders=20","-c","max_replication_slots=20","-c","shared_preload_libraries=pg_stat_statements"]
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable"
+    ports: ["9187:9187"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redpanda:
+    image: redpandadata/redpanda:v24.1.8
+    container_name: redpanda
+    command:
+      - redpanda start
+      - --smp 2
+      - --memory 1G
+      - --reserve-memory 0M
+      - --overprovisioned
+      - --node-id 0
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+      - --advertise-kafka-addr PLAINTEXT://redpanda:9092,OUTSIDE://localhost:19092
+    ports: ["9092:9092","19092:19092"]
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+    healthcheck:
+      test: ["CMD-SHELL","rpk cluster info --brokers localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.6.0
+    container_name: kafka-exporter
+    command: --kafka.server=redpanda:9092
+    ports: ["9308:9308"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  connect:
+    image: quay.io/debezium/connect:2.7.3.Final
+    container_name: connect
+    user: "1000:1000"
+    environment:
+      BOOTSTRAP_SERVERS: redpanda:9092
+      GROUP_ID: "connect-cluster"
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      PLUGIN_PATH: /kafka/connect,/debezium
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx1G"
+      CONNECT_REST_ADVERTISED_HOST_NAME: connect
+      CONNECT_REST_PORT: 8083
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports: ["8083:8083"]
+    volumes:
+      - ./connectors:/connectors
+      - ./connectors/clickhouse-kc:/kafka/connect/clickhouse-kc
+      - ./connectors/install-clickhouse-plugin.sh:/usr/local/bin/install-clickhouse-plugin.sh:ro
+    entrypoint: ["/bin/bash","-lc","bash /usr/local/bin/install-clickhouse-plugin.sh && exec /docker-entrypoint.sh start"]
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8083/connector-plugins | grep -q com.clickhouse.kafka.connect.ClickHouseSinkConnector"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.5
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    ports: ["8123:8123","9000:9000"]
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.xml:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.xml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+    healthcheck:
+      test: ["CMD-SHELL","clickhouse-client -q 'SELECT 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  clickhouse-exporter:
+    image: f1yegor/clickhouse-exporter:latest
+    container_name: clickhouse-exporter
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    ports: ["9116:9116"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    command: redis-server --requirepass ${REDIS_PASSWORD} --maxmemory 512mb --maxmemory-policy allkeys-lru
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports: ["6379:6379"]
+    volumes:
+      - redis_data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+    healthcheck:
+      test: ["CMD","redis-cli","-a","${REDIS_PASSWORD}","PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.55.0
+    container_name: redis-exporter
+    environment:
+      REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports: ["9121:9121"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  flink-jobmanager:
+    image: flink:1.18.1-scala_2.12
+    container_name: flink-jm
+    command: >
+      /bin/bash -lc "command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y curl);
+      bash /opt/flink/sql/download_flink_jars.sh && exec /docker-entrypoint.sh jobmanager"
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jm
+        state.backend: filesystem
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        execution.checkpointing.interval: 30s
+        parallelism.default: 2
+        jobmanager.memory.process.size: 1g
+        taskmanager.memory.process.size: 1g
+    ports: ["8081:8081"]
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ./flink/sql:/opt/flink/sql
+      - flink_checkpoints:/opt/flink/checkpoints
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+    healthcheck:
+      test: ["CMD-SHELL","curl -fsS http://localhost:8081/jobs >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  flink-taskmanager:
+    image: flink:1.18.1-scala_2.12
+    container_name: flink-tm
+    command: >
+      /bin/bash -lc "command -v curl >/dev/null 2>&1 || (apt-get update && apt-get install -y curl);
+      bash /opt/flink/sql/download_flink_jars.sh && exec /docker-entrypoint.sh taskmanager"
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jm
+        taskmanager.numberOfTaskSlots: 4
+        taskmanager.memory.process.size: 1g
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    volumes:
+      - ./flink/sql:/opt/flink/sql
+      - flink_checkpoints:/opt/flink/checkpoints
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+    restart: unless-stopped
+
+  flink-sql-runner:
+    image: flink:1.18.1-scala_2.12
+    container_name: flink-sql-runner
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    volumes:
+      - ./flink/sql:/opt/flink/sql
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jm
+        parallelism.default: 2
+    entrypoint: ["/bin/bash","-lc","/opt/flink/sql/run-sql.sh"]
+
+  event-generator:
+    build:
+      context: ./generator
+      dockerfile: Dockerfile.prod
+    container_name: event-generator
+    environment:
+      PGHOST: ${POSTGRES_HOST}
+      PGPORT: ${POSTGRES_PORT}
+      PGDATABASE: ${POSTGRES_DB}
+      PGUSER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      GEN_MIN_INTERVAL: "5.0"
+      GEN_MAX_INTERVAL: "15.0"
+      LOG_LEVEL: ${LOG_LEVEL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.2'
+    restart: unless-stopped
+
+  redis-agg:
+    build:
+      context: ./consumers
+      dockerfile: Dockerfile.prod
+    container_name: redis-agg
+    environment:
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP_SERVERS}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL}
+    command: python -u redis_agg_v2.py
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    restart: unless-stopped
+
+  http-sink:
+    build:
+      context: ./consumers
+      dockerfile: Dockerfile.prod
+    container_name: http-sink
+    environment:
+      KAFKA_BOOTSTRAP: ${KAFKA_BOOTSTRAP_SERVERS}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      EXTERNAL_ENDPOINT: "http://external-api:${EXTERNAL_API_PORT}/events"
+      LOG_LEVEL: ${LOG_LEVEL}
+    command: python -u http_sink_v2.py
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      external-api:
+        condition: service_started
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    restart: unless-stopped
+
+  external-api:
+    build:
+      context: ./external
+      dockerfile: Dockerfile.prod
+    container_name: external-api
+    environment:
+      API_SECRET_KEY: ${EXTERNAL_API_SECRET_KEY}
+      EXTERNAL_API_PORT: ${EXTERNAL_API_PORT}
+      LOG_LEVEL: ${LOG_LEVEL}
+    ports: ["${EXTERNAL_API_PORT}:${EXTERNAL_API_PORT}"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:${EXTERNAL_API_PORT}/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  airflow:
+    image: apache/airflow:2.9.3
+    container_name: airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+      AIRFLOW__WEBSERVER__AUTHENTICATE: "true"
+      AIRFLOW__WEBSERVER__AUTH_BACKEND: "airflow.api.auth.backend.basic_auth"
+      AIRFLOW_CONN_CLICKHOUSE_HTTP: "http://${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}/"
+      AIRFLOW_CONN_CONNECT_HTTP: "http://connect:8083/"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    ports: ["8080:8080"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./airflow/entrypoint-prod.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/bash","/entrypoint.sh"]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      connect:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.45.0
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=7d'
+      - '--web.enable-lifecycle'
+    ports: ["9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus_data:/prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.5'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.0.0
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports: ["3000:3000"]
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.2'
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redpanda_data:
+  clickhouse_data:
+  redis_data:
+  flink_checkpoints:
+  prometheus_data:
+  grafana_data:
